@@ -135,6 +135,24 @@ fn malformed_native_hook_payload_warns_without_leaking_or_spooling() {
 }
 
 #[test]
+fn zero_session_end_emits_json_and_keeps_event_spooled_when_server_is_down() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let payload = br#"{"sessionId":"zero-runtime","cwd":"/tmp/project"}"#;
+
+    let output = run_hook_full_agent(tmp.path(), "zero", "session-end", payload, false);
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"{}\n");
+    assert!(
+        output.stderr.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let entry = spooled_entry(tmp.path());
+    assert_eq!(entry["attempts"], 0, "an unreachable server costs no retry");
+}
+
+#[test]
 fn stop_hook_strips_last_assistant_message_from_spool_and_stderr() {
     // A well-formed Stop payload carrying Claude Code's `last_assistant_message`
     // must be spooled WITHOUT that raw field (#196). Optional capture remains

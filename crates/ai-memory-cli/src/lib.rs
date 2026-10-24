@@ -1,7 +1,7 @@
 //! `ai-memory` CLI library.
 //!
 //! Holds everything the `ai-memory` binary does. `main.rs` is a shim over
-//! [`run`], so this logic lives in a lib target rather than a bin target:
+//! [`run_blocking`], so this logic lives in a lib target rather than a bin target:
 //! unit tests compile into a reusable rlib, integration tests can link it
 //! directly instead of shelling out to the executable, and `--lib` runs skip
 //! building the binary entirely.
@@ -14,8 +14,10 @@
 #![doc(html_no_source)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
+use tokio::runtime::Builder;
 use tracing::info;
 
 mod auth_bearer;
@@ -35,17 +37,66 @@ mod terminal;
 use cli::{Cli, Command};
 use config::Config;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeFlavor {
+    CurrentThread,
+    MultiThread,
+}
+
+fn runtime_flavor(command: &Command) -> RuntimeFlavor {
+    match command {
+        Command::Hook(_) | Command::HookDrain(_) => RuntimeFlavor::CurrentThread,
+        _ => RuntimeFlavor::MultiThread,
+    }
+}
+
+/// Parses argv once, builds the runtime appropriate to the selected command,
+/// and blocks until dispatch returns.
+pub fn run_blocking() -> Result<()> {
+    let cli = cli::parse_process();
+    // Build by hand rather than with `#[tokio::main]` for the
+    // `shutdown_timeout` below. Lifecycle hooks are one-shot commands; the
+    // remaining commands keep the runtime shape `#[tokio::main]` would use.
+    let runtime = match runtime_flavor(&cli.command) {
+        RuntimeFlavor::CurrentThread => Builder::new_current_thread(),
+        RuntimeFlavor::MultiThread => Builder::new_multi_thread(),
+    }
+    .enable_all()
+    .build()?;
+    let result = runtime.block_on(run_cli(cli));
+    // Dispatch has returned and dropped the handles it owned, but the store
+    // writer's `Shutdown`-and-join does NOT run here: the maintenance
+    // scheduler's detached tasks (and, once a client has connected, the
+    // client-activity flush loop) hold surviving `WriterHandle` clones, so
+    // `WriterInner::drop` never fires and `shutdown_timeout(ZERO)` abandons
+    // those tasks rather than letting them finish. Writes still queued on the
+    // writer at signal time are dropped — the same abruptness an un-handled
+    // interrupt already imposes on a server that is not PID 1 (#703, #710).
+    // What this DOES cure is the stdio hang: the MCP stdio transport reads
+    // stdin on a blocking thread that cannot be cancelled, and dropping the
+    // runtime would otherwise wait for that read forever, which is what kept
+    // `serve --transport stdio` alive after a handled Ctrl-C (#699). Nothing
+    // awaits that read's result any more, so stop waiting and let the process
+    // exit.
+    runtime.shutdown_timeout(Duration::ZERO);
+    result
+}
+
 /// Parses argv, loads config, and dispatches to the requested subcommand.
 ///
 /// Returns the subcommand's result. Commands that carry a non-zero process
 /// exit code call [`std::process::exit`] directly rather than encoding it in
 /// the return type.
 pub async fn run() -> Result<()> {
+    run_cli(cli::parse_process()).await
+}
+
+async fn run_cli(cli: Cli) -> Result<()> {
     let Cli {
         data_dir,
         config: config_path,
         command,
-    } = cli::parse_process();
+    } = cli;
 
     // Hooks fire on every tool call: they must be cheap and must emit ONLY
     // their JSON object to stdout. Short-circuit before config load and
@@ -207,5 +258,31 @@ pub async fn run() -> Result<()> {
         Command::Completions(args) => commands::completions::run(args),
         // `RenderPlugins` is handled in the fast-path above.
         Command::RenderPlugins(args) => commands::render_plugins::run(args),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_hook_commands_use_the_current_thread_runtime() {
+        for argv in [
+            &[
+                "ai-memory",
+                "hook",
+                "--event",
+                "pre-tool-use",
+                "--agent",
+                "claude-code",
+            ][..],
+            &["ai-memory", "--data-dir", "/tmp", "hook-drain"][..],
+        ] {
+            let cli = cli::try_parse_from(argv).expect("hook command parses");
+            assert_eq!(runtime_flavor(&cli.command), RuntimeFlavor::CurrentThread);
+        }
+
+        let serve = cli::try_parse_from(["ai-memory", "serve"]).expect("serve parses");
+        assert_eq!(runtime_flavor(&serve.command), RuntimeFlavor::MultiThread);
     }
 }

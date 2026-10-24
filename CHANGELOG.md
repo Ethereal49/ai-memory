@@ -13,6 +13,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Lifecycle `hook` and `hook-drain` commands now run on a single-threaded
+  Tokio runtime instead of spawning one worker per logical CPU at process
+  startup. Hook JSON output, spooling, draining and shutdown behavior are
+  unchanged; long-running commands such as `serve` keep the multi-threaded
+  runtime ([#1669](https://github.com/akitaonrails/ai-memory/issues/1669)).
+
 - `ai-memory user list` and `ai-memory api-key list` now size their columns
   by terminal display width rather than bytes, as `list-projects` and the
   grants tables already do. An accented username, display name or key label
